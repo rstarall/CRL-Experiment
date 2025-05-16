@@ -17,176 +17,155 @@ def load_all_entities(data_dir="rl_moldel/dataset/ner_data", target_entity_count
     """
     all_entities = {}
     entity_relations = {}
+    entity_name_to_id = {}  # 用于将实体名称映射到实体ID
     file_count = 0
     entity_count = 0
     relation_count = 0
-    synthetic_count = 0
 
-    # 遍历数据目录
+    # 获取所有年份目录
+    year_dirs = []
     for year_dir in os.listdir(data_dir):
         year_path = os.path.join(data_dir, year_dir)
         if os.path.isdir(year_path):
-            for file_name in os.listdir(year_path):
-                if file_name.endswith('.json'):
-                    file_path = os.path.join(year_path, file_name)
-                    try:
-                        with open(file_path, 'r', encoding='utf-8') as f:
-                            data = json.load(f)
-                            file_count += 1
+            year_dirs.append(year_dir)
 
-                            # 提取实体
-                            if "Entities" in data:
-                                entities_in_file = []
-                                for entity in data["Entities"]:
-                                    entity_id = entity.get("EntityId", "")
-                                    if entity_id:
-                                        if entity_id not in all_entities:
-                                            all_entities[entity_id] = entity
-                                            entity_count += 1
-                                        entities_in_file.append(entity_id)
+    # 按顺序处理年份目录
+    year_dirs.sort()
 
-                                # 为同一文件中的实体创建关系
-                                # 这里我们假设同一文件中的实体之间可能存在关系
-                                # 我们根据实体类型创建关系
-                                from action_env import action_space_constraint
+    # 获取所有JSON文件路径
+    all_json_files = []
+    for year_dir in year_dirs:
+        year_path = os.path.join(data_dir, year_dir)
+        file_names = [f for f in os.listdir(year_path) if f.endswith('.json')]
+        file_names.sort()  # 按顺序处理文件
+        for file_name in file_names:
+            file_path = os.path.join(year_path, file_name)
+            all_json_files.append(file_path)
 
-                                for i, source_id in enumerate(entities_in_file):
-                                    for target_id in entities_in_file[i+1:]:
-                                        source_type = all_entities[source_id].get("EntityType", "unknown")
-                                        target_type = all_entities[target_id].get("EntityType", "unknown")
+    # 处理单个文件的函数
+    def process_file(file_path, file_index):
+        nonlocal file_count, entity_count, relation_count
 
-                                        # 根据实体类型确定可能的关系类型
-                                        possible_relations = []
-                                        for relation_type, constraint in action_space_constraint.items():
-                                            valid_source_types = constraint.get("source_types", [])
-                                            valid_target_types = constraint.get("target_types", [])
+        try:
+            with open(file_path, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+                file_count += 1
 
-                                            if source_type in valid_source_types and target_type in valid_target_types:
-                                                possible_relations.append(relation_type)
+                # 创建文件内部的实体ID到全局实体ID的映射
+                local_id_to_global_id = {}
+                file_entity_name_to_id = {}  # 文件内部的实体名称到实体ID的映射
 
-                                        # 如果有可能的关系，随机选择一个
-                                        if possible_relations:
-                                            relation_type = random.choice(possible_relations)
-                                            relation_key = (source_id, target_id)
-                                            if relation_key not in entity_relations:
-                                                entity_relations[relation_key] = []
-                                            if relation_type not in entity_relations[relation_key]:
-                                                entity_relations[relation_key].append(relation_type)
-                                                relation_count += 1
+                # 提取实体
+                entities_in_file = []
+                if "Entities" in data:
+                    for entity in data["Entities"]:
+                        local_entity_id = entity.get("EntityId", "")
+                        entity_name = entity.get("EntityName", "")
 
-                            # 如果数据中有明确的关系字段，也提取它们
-                            if "Relations" in data:
-                                for relation in data["Relations"]:
-                                    source_id = relation.get("SourceId", "")
-                                    target_id = relation.get("TargetId", "")
-                                    relation_type = relation.get("RelationType", "")
+                        if local_entity_id and entity_name:
+                            # 创建全局唯一的实体ID
+                            global_entity_id = f"file_{file_index}_{local_entity_id}"
 
-                                    if source_id and target_id and relation_type:
-                                        relation_key = (source_id, target_id)
-                                        if relation_key not in entity_relations:
-                                            entity_relations[relation_key] = []
-                                        if relation_type not in entity_relations[relation_key]:
-                                            entity_relations[relation_key].append(relation_type)
-                                            relation_count += 1
-                    except Exception as e:
-                        print(f"Error loading {file_path}: {e}")
+                            # 更新实体的ID
+                            entity["EntityId"] = global_entity_id
 
-    # 如果实体数量不足目标数量，生成合成实体
-    original_entity_count = len(all_entities)
-    if original_entity_count < target_entity_count:
-        print(f"实际实体数量({original_entity_count})不足目标数量({target_entity_count})，生成合成实体...")
+                            # 添加到全局实体集合
+                            all_entities[global_entity_id] = entity
 
-        # 获取所有实体类型
-        entity_types = {}
-        for entity_id, entity in all_entities.items():
-            entity_type = entity.get("EntityType", "unknown")
-            if entity_type not in entity_types:
-                entity_types[entity_type] = []
-            entity_types[entity_type].append(entity_id)
+                            # 更新映射
+                            local_id_to_global_id[local_entity_id] = global_entity_id
+                            entity_name_to_id[entity_name] = global_entity_id
+                            file_entity_name_to_id[entity_name] = global_entity_id
 
-        # 生成合成实体
-        original_entities = list(all_entities.keys())
-        while len(all_entities) < target_entity_count:
-            # 随机选择一个原始实体作为模板
-            template_id = random.choice(original_entities)
-            template_entity = all_entities[template_id]
+                            entity_count += 1
+                            entities_in_file.append(global_entity_id)
 
-            # 创建一个新的合成实体
-            synthetic_id = f"synthetic_entity_{synthetic_count}"
-            synthetic_entity = template_entity.copy()
-            synthetic_entity["EntityId"] = synthetic_id
+                    # 为同一文件中的实体创建关系
+                    # 这里我们假设同一文件中的实体之间可能存在关系
+                    # 我们根据实体类型创建关系
+                    from rl_moldel.action_env import action_space_constraint
 
-            # 修改实体名称
-            if "EntityName" in synthetic_entity:
-                synthetic_entity["EntityName"] = f"{synthetic_entity['EntityName']}_syn_{synthetic_count}"
+                    for i, source_id in enumerate(entities_in_file):
+                        for target_id in entities_in_file[i+1:]:
+                            source_type = all_entities[source_id].get("EntityType", "unknown")
+                            target_type = all_entities[target_id].get("EntityType", "unknown")
 
-            # 保持实体类型不变
-            entity_type = synthetic_entity.get("EntityType", "unknown")
+                            # 根据实体类型确定可能的关系类型
+                            possible_relations = []
+                            for relation_type, constraint in action_space_constraint.items():
+                                valid_source_types = constraint.get("source_types", [])
+                                valid_target_types = constraint.get("target_types", [])
 
-            # 随机修改一些属性，使合成实体有所不同
-            if "Labels" in synthetic_entity and synthetic_entity["Labels"]:
-                # 随机删除或添加一些标签
-                if random.random() < 0.5 and len(synthetic_entity["Labels"]) > 1:
-                    synthetic_entity["Labels"].pop(random.randrange(len(synthetic_entity["Labels"])))
-                else:
-                    all_labels = set()
-                    for e in all_entities.values():
-                        if "Labels" in e:
-                            all_labels.update(e["Labels"])
-                    if all_labels:
-                        new_label = random.choice(list(all_labels))
-                        if new_label not in synthetic_entity["Labels"]:
-                            synthetic_entity["Labels"].append(new_label)
+                                if source_type in valid_source_types and target_type in valid_target_types:
+                                    possible_relations.append(relation_type)
 
-            # 随机修改时间
-            if "Times" in synthetic_entity and synthetic_entity["Times"]:
-                synthetic_entity["Times"] = [str(int(t) + random.randint(-2, 2)) for t in synthetic_entity["Times"]]
+                            # 如果有可能的关系，随机选择一个
+                            if possible_relations:
+                                relation_type = random.choice(possible_relations)
+                                relation_key = (source_id, target_id)
+                                if relation_key not in entity_relations:
+                                    entity_relations[relation_key] = []
+                                if relation_type not in entity_relations[relation_key]:
+                                    entity_relations[relation_key].append(relation_type)
+                                    relation_count += 1
 
-            # 添加合成实体
-            all_entities[synthetic_id] = synthetic_entity
-            synthetic_count += 1
+                # 如果数据中有明确的关系字段，也提取它们
+                if "Relationships" in data:
+                    for relation in data["Relationships"]:
+                        source_name = relation.get("Source", "")
+                        target_name = relation.get("Target", "")
+                        relation_type = relation.get("RelationshipType", "")
 
-            # 为合成实体创建关系
-            # 与同类型的实体创建关系
-            if entity_type in entity_types:
-                for other_id in entity_types[entity_type]:
-                    if other_id != synthetic_id and random.random() < 0.3:  # 30%的概率创建关系
-                        from action_env import action_space_constraint
+                        # 将实体名称转换为实体ID
+                        source_id = file_entity_name_to_id.get(source_name, "")
+                        target_id = file_entity_name_to_id.get(target_name, "")
 
-                        # 根据实体类型确定可能的关系类型
-                        possible_relations = []
-                        for relation_type, constraint in action_space_constraint.items():
-                            valid_source_types = constraint.get("source_types", [])
-                            valid_target_types = constraint.get("target_types", [])
-
-                            if entity_type in valid_source_types and entity_type in valid_target_types:
-                                possible_relations.append(relation_type)
-
-                        # 如果有可能的关系，随机选择一个
-                        if possible_relations:
-                            relation_type = random.choice(possible_relations)
-
-                            # 创建双向关系
-                            relation_key1 = (synthetic_id, other_id)
-                            if relation_key1 not in entity_relations:
-                                entity_relations[relation_key1] = []
-                            if relation_type not in entity_relations[relation_key1]:
-                                entity_relations[relation_key1].append(relation_type)
+                        if source_id and target_id and relation_type:
+                            relation_key = (source_id, target_id)
+                            if relation_key not in entity_relations:
+                                entity_relations[relation_key] = []
+                            if relation_type not in entity_relations[relation_key]:
+                                entity_relations[relation_key].append(relation_type)
                                 relation_count += 1
 
-                            relation_key2 = (other_id, synthetic_id)
-                            if relation_key2 not in entity_relations:
-                                entity_relations[relation_key2] = []
-                            if relation_type not in entity_relations[relation_key2]:
-                                entity_relations[relation_key2].append(relation_type)
+                # 兼容旧版本的关系字段名称
+                if "Relations" in data:
+                    for relation in data["Relations"]:
+                        local_source_id = relation.get("SourceId", "")
+                        local_target_id = relation.get("TargetId", "")
+                        relation_type = relation.get("RelationType", "")
+
+                        # 将本地实体ID转换为全局实体ID
+                        source_id = local_id_to_global_id.get(local_source_id, "")
+                        target_id = local_id_to_global_id.get(local_target_id, "")
+
+                        if source_id and target_id and relation_type:
+                            relation_key = (source_id, target_id)
+                            if relation_key not in entity_relations:
+                                entity_relations[relation_key] = []
+                            if relation_type not in entity_relations[relation_key]:
+                                entity_relations[relation_key].append(relation_type)
                                 relation_count += 1
 
-            # 更新实体类型列表
-            if entity_type not in entity_types:
-                entity_types[entity_type] = []
-            entity_types[entity_type].append(synthetic_id)
+                return True
+        except Exception as e:
+            print(f"Error loading {file_path}: {e}")
+            return False
 
-    print(f"加载了 {file_count} 个文件，共 {original_entity_count} 个原始实体，{synthetic_count} 个合成实体，总计 {len(all_entities)} 个实体，{relation_count} 个关系")
+    # 处理文件直到达到目标实体数量或处理完所有文件
+    for file_index, file_path in enumerate(all_json_files):
+        process_file(file_path, file_index)
+
+        # 检查是否已达到目标实体数量
+        if len(all_entities) >= target_entity_count:
+            break
+
+    # 如果处理完所有文件后，实体数量仍然不足目标数量，则发出警告
+    if len(all_entities) < target_entity_count:
+        print(f"警告: 处理完所有文件后，实际实体数量({len(all_entities)})仍不足目标数量({target_entity_count})。")
+        print(f"请考虑减小目标实体数量或添加更多实体数据文件。")
+
+    print(f"加载了 {file_count} 个文件，共 {len(all_entities)} 个实体，{relation_count} 个关系")
     return all_entities, entity_relations
 
 def build_graph_from_entities(entities, entity_relations, max_entity_num=1024):

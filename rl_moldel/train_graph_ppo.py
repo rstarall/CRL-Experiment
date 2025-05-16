@@ -4,6 +4,7 @@ import numpy as np
 import torch
 import random
 import networkx as nx
+import uuid
 # 尝试导入matplotlib，如果不可用则使用替代方案
 try:
     import matplotlib.pyplot as plt
@@ -16,6 +17,7 @@ import pickle
 import time
 import json
 import sys
+import shutil
 
 # 尝试导入TensorBoard，如果不可用则使用替代方案
 try:
@@ -48,7 +50,7 @@ current_dir = os.path.dirname(os.path.abspath(__file__))
 project_root = os.path.dirname(current_dir)  # experiment目录
 sys.path.append(project_root)
 
-from rl_moldel.fixed_dim_graph_env import FixedDimGraphEnvironment
+from rl_moldel.graph_env import FixedDimGraphEnvironment
 from rl_moldel.data_loader import load_all_entities
 from rl_moldel.ppo import PPO
 from casual_model.THP.train import DiscreteTopoHawkesModel, casual_model_graph
@@ -63,20 +65,123 @@ def set_seed(seed):
         torch.cuda.manual_seed_all(seed)
     torch.backends.cudnn.deterministic = True
 
+def plot_curves(data, plot_type, save_path, episode_num=None):
+    """
+    绘制并保存各种曲线图
+
+    参数:
+        data: 要绘制的数据，可以是单个列表或字典
+        plot_type: 图表类型，'reward'或'loss'
+        save_path: 保存图表的路径
+        episode_num: 当前回合数，用于文件名（可选）
+
+    返回:
+        保存的图表文件路径
+    """
+    print(f"开始绘制图表: 类型={plot_type}, 保存路径={save_path}, 回合数={episode_num}")
+
+    if not has_matplotlib:
+        print("matplotlib未安装，无法生成图表")
+        return None
+
+
+    if plot_type == 'reward':
+        # 绘制奖励曲线
+        plt.figure(figsize=(10, 5))
+        plt.plot(data)
+        plt.title('Episode Rewards')
+        plt.xlabel('Episode')
+        plt.ylabel('Reward')
+        plt.tight_layout()
+
+        # 确定保存路径
+        if episode_num is not None:
+            file_path = os.path.join(save_path, f'reward_curve_episode_{episode_num}.png')
+        else:
+            file_path = os.path.join(save_path, 'reward_curve.png')
+
+        try:
+            # 确保目录存在
+            os.makedirs(os.path.dirname(file_path), exist_ok=True)
+            plt.savefig(file_path)
+            plt.close()
+            print(f"奖励曲线图已成功保存到: {file_path}")
+            return file_path
+        except Exception as e:
+            print(f"保存奖励曲线图时出错: {e}")
+            plt.close()
+            return None
+
+    elif plot_type == 'loss':
+        # 绘制损失曲线
+        plt.figure(figsize=(15, 10))
+
+        # 总损失
+        plt.subplot(2, 2, 1)
+        plt.plot(data['total_losses'])
+        plt.title('Total Loss')
+        plt.xlabel('Episode')
+        plt.ylabel('Loss')
+
+        # 策略损失
+        plt.subplot(2, 2, 2)
+        plt.plot(data['policy_losses'])
+        plt.title('Policy Loss')
+        plt.xlabel('Episode')
+        plt.ylabel('Loss')
+
+        # 价值损失
+        plt.subplot(2, 2, 3)
+        plt.plot(data['value_losses'])
+        plt.title('Value Loss')
+        plt.xlabel('Episode')
+        plt.ylabel('Loss')
+
+        # 熵损失
+        plt.subplot(2, 2, 4)
+        plt.plot(data['entropy_losses'])
+        plt.title('Entropy Loss')
+        plt.xlabel('Episode')
+        plt.ylabel('Loss')
+
+        plt.tight_layout()
+
+        # 确定保存路径
+        if episode_num is not None:
+            file_path = os.path.join(save_path, f'loss_curves_episode_{episode_num}.png')
+        else:
+            file_path = os.path.join(save_path, 'all_loss_curves.png')
+
+        try:
+            # 确保目录存在
+            os.makedirs(os.path.dirname(file_path), exist_ok=True)
+            plt.savefig(file_path)
+            plt.close()
+            print(f"损失曲线图已成功保存到: {file_path}")
+            return file_path
+        except Exception as e:
+            print(f"保存损失曲线图时出错: {e}")
+            plt.close()
+            return None
+
+    else:
+        print(f"不支持的图表类型: {plot_type}")
+        return None
+
 def main():
-    parser = argparse.ArgumentParser(description="固定维度图谱关系推理PPO训练")
+    parser = argparse.ArgumentParser(description="固定图谱PPO训练")
     # 训练参数
     parser.add_argument('--cuda', type=int, default=0, help='GPU设备ID')
     parser.add_argument('--seed', type=int, default=42, help='随机种子')
     parser.add_argument('--max_episodes', type=int, default=2000, help='最大训练回合数')
-    parser.add_argument('--max_ep_len', type=int, default=100, help='每个回合的最大步数')
+    parser.add_argument('--max_ep_len', type=int, default=64, help='每个回合的最大步数')
     parser.add_argument('--output_dir', type=str, default='rl_moldel/output', help='输出目录')
     parser.add_argument('--thp_model_path', type=str, default='casual_model/THP/models/discrete_topo_hawkes_model.npz', help='THP模型路径')
-    parser.add_argument('--max_entity_num', type=int, default=128, help='最大实体数量')
+    parser.add_argument('--max_entity_num', type=int, default=64, help='固定实体数量')
 
     # 超参数调整
-    parser.add_argument('--lr_actor', type=float, default=0.0003, help='Actor网络学习率')
-    parser.add_argument('--lr_critic', type=float, default=0.0003, help='Critic网络学习率')
+    parser.add_argument('--lr_actor', type=float, default=0.003, help='Actor网络学习率')
+    parser.add_argument('--lr_critic', type=float, default=0.003, help='Critic网络学习率')
     parser.add_argument('--batch_size', type=int, default=64, help='批量大小')
     parser.add_argument('--hidden_units', type=int, default=128, help='隐藏层单元数')
     parser.add_argument('--k_epochs', type=int, default=10, help='每次更新的epoch数')
@@ -87,13 +192,17 @@ def main():
     parser.add_argument('--min_lr', type=float, default=1e-5, help='最小学习率')
 
     # 检查点保存
-    parser.add_argument('--save_freq', type=int, default=50, help='保存检查点的频率（回合数）')
+    parser.add_argument('--save_freq', type=int, default=10, help='保存检查点的频率（回合数）')
     parser.add_argument('--resume', type=str, default='', help='恢复训练的检查点路径')
 
     args = parser.parse_args()
 
     # 设置随机种子
     set_seed(args.seed)
+
+    # 生成唯一ID
+    run_id = str(uuid.uuid4())[:8]
+    print(f"本次训练的唯一ID: {run_id}")
 
     # 设置设备
     use_cuda = torch.cuda.is_available()
@@ -102,9 +211,10 @@ def main():
 
     # 打印训练配置
     print("\n====== 训练配置 ======")
+    print(f"训练ID: {run_id}")
     print(f"最大训练回合数: {args.max_episodes}")
     print(f"每回合最大步数: {args.max_ep_len}")
-    print(f"最大实体数量: {args.max_entity_num}")
+    print(f"固定实体数量: {args.max_entity_num}")
     print(f"Actor学习率: {args.lr_actor}")
     print(f"Critic学习率: {args.lr_critic}")
     print(f"批量大小: {args.batch_size}")
@@ -118,11 +228,19 @@ def main():
     print("======================")
 
     # 创建输出目录
-    output_dir = args.output_dir
+    output_dir = os.path.join(args.output_dir, run_id)
     os.makedirs(output_dir, exist_ok=True)
+    print(f"输出将保存在: {output_dir}")
+
+    # 保存训练配置
+    config_path = os.path.join(output_dir, "config.json")
+    with open(config_path, 'w') as f:
+        json.dump(vars(args), f, indent=4)
+    print(f"训练配置已保存到: {config_path}")
 
     # 创建TensorBoard日志
-    log_dir = os.path.join(output_dir, "logs", f"run_{int(time.time())}")
+    log_dir = os.path.join(output_dir, "logs")
+    os.makedirs(log_dir, exist_ok=True)
     writer = SummaryWriter(log_dir=log_dir)
 
     # 加载所有实体数据，确保达到目标实体数量
@@ -131,10 +249,23 @@ def main():
 
     # 验证实体数量
     if len(all_entities) < args.max_entity_num:
-        print(f"错误: 实体数量({len(all_entities)})小于目标数量({args.max_entity_num})，请检查数据加载函数")
-        return
-    else:
-        print(f"成功加载了 {len(all_entities)} 个实体，满足目标数量 {args.max_entity_num}")
+        print(f"警告: 实体数量({len(all_entities)})小于目标数量({args.max_entity_num})，将使用所有可用实体")
+        # 更新max_entity_num为实际实体数量
+        args.max_entity_num = len(all_entities)
+
+    print(f"成功加载了 {len(all_entities)} 个实体，将使用 {args.max_entity_num} 个实体进行训练")
+
+    # 保存实体和关系数据
+    entity_data_path = os.path.join(output_dir, "entity_data.pkl")
+    with open(entity_data_path, 'wb') as f:
+        pickle.dump(all_entities, f)
+
+    relation_data_path = os.path.join(output_dir, "relation_data.pkl")
+    with open(relation_data_path, 'wb') as f:
+        pickle.dump(entity_relations, f)
+
+    print(f"实体数据已保存到: {entity_data_path}")
+    print(f"关系数据已保存到: {relation_data_path}")
 
     # 加载THP模型
     # 确保THP模型路径是绝对路径
@@ -156,11 +287,16 @@ def main():
             print(f"错误: 备用路径也不存在: {alt_path}")
             return
 
+    # 复制THP模型到输出目录
+    thp_model_copy_path = os.path.join(output_dir, os.path.basename(thp_model_path))
+    shutil.copy2(thp_model_path, thp_model_copy_path)
+    print(f"THP模型已复制到: {thp_model_copy_path}")
+
     hawkes_model = DiscreteTopoHawkesModel.load_model(thp_model_path, casual_model_graph)
 
     # 创建环境
-    print(f"创建固定维度({args.max_entity_num}个实体)的图环境...")
-    env = FixedDimGraphEnvironment(hawkes_model, all_entities, max_entity_num=args.max_entity_num, max_steps=args.max_ep_len)
+    print(f"创建固定图谱环境({args.max_entity_num}个实体)...")
+    env = FixedDimGraphEnvironment(hawkes_model, all_entities, entity_relations=entity_relations, max_entity_num=args.max_entity_num, max_steps=args.max_ep_len)
 
     # 获取状态和动作维度
     state_dim = env.observation_space.shape[0]
@@ -181,6 +317,12 @@ def main():
         "max_grad_norm": 0.5,  # 梯度裁剪参数
         "normalize_advantage": True  # 启用优势标准化
     }
+
+    # 保存PPO配置
+    ppo_config_path = os.path.join(output_dir, "ppo_config.json")
+    with open(ppo_config_path, 'w') as f:
+        json.dump(ppo_config, f, indent=4)
+    print(f"PPO配置已保存到: {ppo_config_path}")
 
     # 创建PPO代理
     print("创建PPO代理...")
@@ -233,12 +375,12 @@ def main():
 
     # 训练PPO
     while i_episode < args.max_episodes:
-        # 重置环境，重新采样实体
-        state = env.reset(resample=True)
+        # 重置环境，但不重新采样实体（保持固定图谱）
+        state = env.reset(resample=False)
         current_ep_reward = 0
 
         # 记录当前图谱的信息
-        print(f"回合 {i_episode}: 使用 {env.entity_num} 个实体，状态维度: {state.shape[0]}")
+        print(f"回合 {i_episode}: 使用固定的 {env.entity_num} 个实体，状态维度: {state.shape[0]}")
 
         for t in range(1, args.max_ep_len + 1):
             # 选择动作
@@ -353,43 +495,20 @@ def main():
             print(f"损失数据已保存到 {loss_data_path}")
 
             # 绘制并保存损失曲线
-            if has_matplotlib:
-                # 创建损失曲线图
-                plt.figure(figsize=(15, 10))
-
-                # 总损失
-                plt.subplot(2, 2, 1)
-                plt.plot(episode_total_losses)
-                plt.title('Total Loss')
-                plt.xlabel('Episode')
-                plt.ylabel('Loss')
-
-                # 策略损失
-                plt.subplot(2, 2, 2)
-                plt.plot(episode_policy_losses)
-                plt.title('Policy Loss')
-                plt.xlabel('Episode')
-                plt.ylabel('Loss')
-
-                # 价值损失
-                plt.subplot(2, 2, 3)
-                plt.plot(episode_value_losses)
-                plt.title('Value Loss')
-                plt.xlabel('Episode')
-                plt.ylabel('Loss')
-
-                # 熵损失
-                plt.subplot(2, 2, 4)
-                plt.plot(episode_entropy_losses)
-                plt.title('Entropy Loss')
-                plt.xlabel('Episode')
-                plt.ylabel('Loss')
-
-                plt.tight_layout()
-                loss_curve_path = os.path.join(loss_dir, f"loss_curves_episode_{i_episode}.png")
-                plt.savefig(loss_curve_path)
-                plt.close()
+            loss_data = {
+                'total_losses': episode_total_losses,
+                'policy_losses': episode_policy_losses,
+                'value_losses': episode_value_losses,
+                'entropy_losses': episode_entropy_losses
+            }
+            loss_curve_path = plot_curves(loss_data, 'loss', loss_dir, i_episode)
+            if loss_curve_path:
                 print(f"损失曲线已保存到 {loss_curve_path}")
+
+            # 绘制并保存奖励曲线
+            reward_curve_path = plot_curves(episode_rewards, 'reward', checkpoint_dir, i_episode)
+            if reward_curve_path:
+                print(f"奖励曲线已保存到 {reward_curve_path}")
 
         # 学习率调度
         if i_episode % args.lr_decay_freq == 0 and i_episode > 0:
@@ -406,21 +525,28 @@ def main():
 
         i_episode += 1
 
-    # 保存模型
-    model_path = os.path.join(output_dir, "fixed_dim_ppo_model.pth")
+    # 保存最终模型
+    model_path = os.path.join(output_dir, "final_model.pth")
     agent.save(model_path)
-    print(f"模型已保存到 {model_path}")
+    print(f"最终模型已保存到 {model_path}")
+
+    # 保存图谱环境状态
+    env_state = {
+        'entity_data': env.entity_data,
+        'entity_types': env.entity_types,
+        'entity_to_tactics': env.entity_to_tactics,
+        'entities': env.entities,
+        'relation_types': env.relation_types,
+        'graph': nx.node_link_data(env.graph)  # 将图转换为可序列化的格式
+    }
+    env_state_path = os.path.join(output_dir, "env_state.pkl")
+    with open(env_state_path, 'wb') as f:
+        pickle.dump(env_state, f)
+    print(f"环境状态已保存到: {env_state_path}")
 
     # 绘制奖励曲线
-    if has_matplotlib:
-        plt.figure(figsize=(10, 5))
-        plt.plot(episode_rewards)
-        plt.title('Episode Rewards')
-        plt.xlabel('Episode')
-        plt.ylabel('Reward')
-        reward_curve_path = os.path.join(output_dir, 'reward_curve.png')
-        plt.savefig(reward_curve_path)
-        plt.close()
+    reward_curve_path = plot_curves(episode_rewards, 'reward', output_dir)
+    if reward_curve_path:
         print(f"奖励曲线已保存到: {reward_curve_path}")
     else:
         print("matplotlib未安装，无法生成奖励曲线图")
@@ -444,48 +570,28 @@ def main():
     print(f"完整损失数据已保存到: {loss_data_path}")
 
     # 绘制并保存完整的损失曲线
-    if has_matplotlib:
-        # 创建损失曲线图
-        plt.figure(figsize=(15, 10))
-
-        # 总损失
-        plt.subplot(2, 2, 1)
-        plt.plot(episode_total_losses)
-        plt.title('Total Loss')
-        plt.xlabel('Episode')
-        plt.ylabel('Loss')
-
-        # 策略损失
-        plt.subplot(2, 2, 2)
-        plt.plot(episode_policy_losses)
-        plt.title('Policy Loss')
-        plt.xlabel('Episode')
-        plt.ylabel('Loss')
-
-        # 价值损失
-        plt.subplot(2, 2, 3)
-        plt.plot(episode_value_losses)
-        plt.title('Value Loss')
-        plt.xlabel('Episode')
-        plt.ylabel('Loss')
-
-        # 熵损失
-        plt.subplot(2, 2, 4)
-        plt.plot(episode_entropy_losses)
-        plt.title('Entropy Loss')
-        plt.xlabel('Episode')
-        plt.ylabel('Loss')
-
-        plt.tight_layout()
-        loss_curve_path = os.path.join(output_dir, 'all_loss_curves.png')
-        plt.savefig(loss_curve_path)
-        plt.close()
+    loss_data = {
+        'total_losses': episode_total_losses,
+        'policy_losses': episode_policy_losses,
+        'value_losses': episode_value_losses,
+        'entropy_losses': episode_entropy_losses
+    }
+    loss_curve_path = plot_curves(loss_data, 'loss', output_dir)
+    if loss_curve_path:
         print(f"完整损失曲线已保存到: {loss_curve_path}")
+
+    # 创建训练完成标记文件
+    with open(os.path.join(output_dir, "TRAINING_COMPLETE"), 'w') as f:
+        f.write(f"训练完成时间: {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
+        f.write(f"总回合数: {i_episode}\n")
+        f.write(f"总步数: {time_step}\n")
+        f.write(f"最终奖励: {current_ep_reward}\n")
+        f.write(f"平均奖励(最后10回合): {np.mean(episode_rewards[-10:])}\n")
 
     # 关闭TensorBoard写入器
     writer.close()
 
-    print("训练完成!")
+    print(f"训练完成! 所有输出已保存到: {output_dir}")
 
 if __name__ == "__main__":
     main()

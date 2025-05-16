@@ -1,73 +1,113 @@
-import gym
+import os
 import numpy as np
 import torch
 import networkx as nx
-from gym import spaces
 import random
 import copy
-import os
-from action_env import action_space_constraint
+import gym
+from gym import spaces
+from rl_moldel.action_env import action_space_constraint
 
-class GraphEnvironment(gym.Env):
+class FixedDimGraphEnvironment(gym.Env):
     """
-    基于离散时间拓扑霍克斯过程的强化学习环境，
-    用于威胁情报图谱关系推理补全
+    固定维度的图谱环境，使用固定数量的实体构建图谱
     """
 
-    def __init__(self, hawkes_model, entity_data, max_steps=100):
+    def __init__(self, hawkes_model, all_entities, entity_relations=None, max_entity_num=64, max_steps=100):
         """
         初始化环境
 
         参数:
             hawkes_model: 离散时间拓扑霍克斯模型
-            entity_data: 实体数据 (字典 {实体ID: 实体信息})
+            all_entities: 所有实体数据 (字典 {实体ID: 实体信息})
+            entity_relations: 实体间的关系 (字典 {(源实体ID, 目标实体ID): 关系类型列表})
+            max_entity_num: 固定的实体数量，用于固定维度
             max_steps: 每个回合的最大步数
         """
-        super(GraphEnvironment, self).__init__()
+        super(FixedDimGraphEnvironment, self).__init__()
 
         self.hawkes_model = hawkes_model
-        self.entity_data = entity_data
+        self.all_entities = all_entities
+        self.all_entity_relations = entity_relations or {}
+
+        # 设置最大实体数量
+        self.max_entity_num = max_entity_num
+
+        # 确保实体数量足够
+        if len(all_entities) < self.max_entity_num:
+            print(f"警告: 实体数量({len(all_entities)})小于指定的固定维度({self.max_entity_num})，将使用所有可用实体")
+            # 使用所有可用实体
+            self.max_entity_num = len(all_entities)
         self.max_steps = max_steps
 
-        # 提取实体和关系
-        self.entities = list(entity_data.keys())
+        # 定义关系类型
+        self.relation_types = list(action_space_constraint.keys())
+        self.relation_num = len(self.relation_types)
+
+        # 随机选择固定数量的实体
+        self.sample_entities()
+
+        # 构建参考图谱
+        self.reference_graph = self._build_reference_graph()
+
+        # 定义动作空间
+        # 动作编码: (source_idx, target_idx, relation_type_idx)
+        self.action_dim = self.max_entity_num * self.max_entity_num * self.relation_num
+        self.action_space = spaces.Discrete(self.action_dim)
+
+        # 定义状态空间: 图的邻接矩阵展平 + 当前时间
+        self.state_dim = self.max_entity_num * self.max_entity_num * self.relation_num + 1
+        self.observation_space = spaces.Box(
+            low=0, high=1, shape=(self.state_dim,), dtype=np.float32
+        )
+
+        print(f"创建了固定维度图环境: {self.max_entity_num}个实体, 状态维度={self.state_dim}, 动作维度={self.action_dim}")
+
+        # 初始化状态
+        self.current_time = 0
+        self.current_step = 0
+        self.adjacency_tensor = np.zeros((self.max_entity_num, self.max_entity_num, self.relation_num))
+
+        # 构建战术事件历史
+        self.tactic_event_history = self._build_tactic_event_history()
+
+    def sample_entities(self):
+        """
+        从所有实体中随机抽样固定数量的实体
+        """
+        # 获取所有实体ID
+        all_entity_ids = list(self.all_entities.keys())
+
+        # 确保我们有足够的实体
+        if len(all_entity_ids) < self.max_entity_num:
+            raise ValueError(f"实体数量({len(all_entity_ids)})小于指定的固定维度({self.max_entity_num})，请先生成足够的实体")
+
+        # 随机抽样固定数量的实体
+        self.entities = random.sample(all_entity_ids, self.max_entity_num)
+
+        # 确保实体数量正确
         self.entity_num = len(self.entities)
+        assert self.entity_num == self.max_entity_num, f"实体数量({self.entity_num})不等于指定的固定维度({self.max_entity_num})"
+
+        # 提取实体数据
+        self.entity_data = {entity_id: self.all_entities[entity_id] for entity_id in self.entities}
 
         # 提取实体类型
         self.entity_types = {}
-        for entity_id, entity_info in entity_data.items():
+        for entity_id, entity_info in self.entity_data.items():
             self.entity_types[entity_id] = entity_info.get('EntityType', 'unknown')
+
+        # 构建实体到战术的映射
+        self.entity_to_tactics = {}
+        for entity_id, entity_info in self.entity_data.items():
+            self.entity_to_tactics[entity_id] = entity_info.get('Labels', [])
 
         # 构建图结构
         self.graph = nx.DiGraph()
         for entity_id in self.entities:
             self.graph.add_node(entity_id, type=self.entity_types[entity_id])
 
-        # 定义动作空间
-        # 动作编码: (source_idx, target_idx, relation_type_idx)
-        self.relation_types = list(action_space_constraint.keys())
-        self.relation_num = len(self.relation_types)
-        self.action_dim = self.entity_num * self.entity_num * self.relation_num
-        self.action_space = spaces.Discrete(self.action_dim)
-
-        # 定义状态空间: 图的邻接矩阵展平 + 当前时间
-        self.state_dim = self.entity_num * self.entity_num * self.relation_num + 1
-        self.observation_space = spaces.Box(
-            low=0, high=1, shape=(self.state_dim,), dtype=np.float32
-        )
-
-        # 初始化状态
-        self.current_time = 0
-        self.current_step = 0
-        self.adjacency_tensor = np.zeros((self.entity_num, self.entity_num, self.relation_num))
-
-        # 构建实体到战术的映射
-        self.entity_to_tactics = {}
-        for entity_id, entity_info in entity_data.items():
-            self.entity_to_tactics[entity_id] = entity_info.get('Labels', [])
-
-        # 构建战术事件历史
-        self.tactic_event_history = self._build_tactic_event_history()
+        print(f"采样了 {self.entity_num} 个实体，实体类型分布: {self._get_entity_type_distribution()}")
 
     def _build_tactic_event_history(self):
         """
@@ -99,34 +139,58 @@ class GraphEnvironment(gym.Env):
 
         return tactic_event_history
 
-    def reset(self, partial_graph=None):
+    def _build_reference_graph(self):
+        """
+        构建参考图谱，用于评估预测图谱的准确性
+
+        返回:
+            reference_graph: 参考图谱 (NetworkX DiGraph)
+        """
+        # 创建参考图谱
+        reference_graph = nx.DiGraph()
+
+        # 添加节点
+        for entity_id in self.entities:
+            reference_graph.add_node(entity_id, type=self.entity_types[entity_id])
+
+        # 添加边
+        for (source_id, target_id), relation_types in self.all_entity_relations.items():
+            if source_id in self.entities and target_id in self.entities:
+                for relation_type in relation_types:
+                    if relation_type in self.relation_types:
+                        reference_graph.add_edge(source_id, target_id, relation=relation_type)
+
+        print(f"构建了参考图谱，包含 {reference_graph.number_of_nodes()} 个节点和 {reference_graph.number_of_edges()} 条边")
+        return reference_graph
+
+    def reset(self, resample=True):
         """
         重置环境
 
         参数:
-            partial_graph: 部分图结构，用于图谱补全任务
+            resample: 是否重新采样实体，如果为False，则保持当前实体不变
 
         返回:
             初始状态
         """
+        # 如果需要重新采样实体
+        if resample:
+            self.sample_entities()
+            # 重新构建参考图谱
+            self.reference_graph = self._build_reference_graph()
+            # 重新构建战术事件历史
+            self.tactic_event_history = self._build_tactic_event_history()
+            print(f"已重新采样 {self.entity_num} 个实体")
+        else:
+            print(f"保持固定的 {self.entity_num} 个实体")
+
         # 重置图结构
         self.graph = nx.DiGraph()
         for entity_id in self.entities:
             self.graph.add_node(entity_id, type=self.entity_types[entity_id])
 
         # 重置邻接张量
-        self.adjacency_tensor = np.zeros((self.entity_num, self.entity_num, self.relation_num))
-
-        # 如果提供了部分图，则初始化为部分图结构
-        if partial_graph is not None:
-            for source, targets in partial_graph.items():
-                source_idx = self.entities.index(source)
-                for target, relation in targets:
-                    if target in self.entities and relation in self.relation_types:
-                        target_idx = self.entities.index(target)
-                        relation_idx = self.relation_types.index(relation)
-                        self.graph.add_edge(source, target, relation=relation)
-                        self.adjacency_tensor[source_idx, target_idx, relation_idx] = 1
+        self.adjacency_tensor = np.zeros((self.max_entity_num, self.max_entity_num, self.relation_num))
 
         # 重置时间和步数
         self.current_time = 0
@@ -148,10 +212,17 @@ class GraphEnvironment(gym.Env):
             info: 额外信息
         """
         # 解码动作
-        source_idx = action // (self.entity_num * self.relation_num)
-        remaining = action % (self.entity_num * self.relation_num)
+        source_idx = action // (self.max_entity_num * self.relation_num)
+        remaining = action % (self.max_entity_num * self.relation_num)
         target_idx = remaining // self.relation_num
         relation_idx = remaining % self.relation_num
+
+        # 检查索引是否有效
+        if source_idx >= self.entity_num or target_idx >= self.entity_num:
+            # 无效动作，给予负奖励
+            reward = -0.1
+            done = self._is_done()
+            return self._get_state(), reward, done, {'is_valid': False}
 
         source_entity = self.entities[source_idx]
         target_entity = self.entities[target_idx]
@@ -255,8 +326,8 @@ class GraphEnvironment(gym.Env):
         if not is_valid:
             return -0.1
 
-        # 1. 图谱完整性奖励
-        r1 = self._graph_completeness_reward()
+        # 1. 图谱准确性奖励
+        r1 = self._graph_accuracy_reward()
 
         # 2. 因果一致性奖励
         r2 = self._causal_consistency_reward()
@@ -268,27 +339,45 @@ class GraphEnvironment(gym.Env):
         reward = r1 + r2 + r3
         return reward
 
-    def _graph_completeness_reward(self):
+    def _graph_accuracy_reward(self):
         """
-        计算图谱完整性奖励
+        计算图谱准确性奖励，评估预测图谱与参考图谱的一致性
 
         返回:
-            r1: 图谱完整性奖励
+            r1: 图谱准确性奖励
         """
-        # 计算图的边数
-        edge_count = self.graph.number_of_edges()
-
-        # 计算可能的最大边数
-        max_edge_count = self.entity_num * (self.entity_num - 1) * self.relation_num
-
-        # 计算图的完整性
-        if max_edge_count == 0:
+        # 如果参考图谱为空，返回0
+        if self.reference_graph.number_of_edges() == 0:
             return 0
 
-        completeness = edge_count / max_edge_count
+        # 计算真阳性(TP)、假阳性(FP)、假阴性(FN)
+        tp = 0  # 正确预测的边
+        fp = 0  # 错误预测的边
+        fn = 0  # 未预测的边
 
-        # 使用非线性函数，鼓励适度的边数
-        return 0.1 * (1 - abs(completeness - 0.3))
+        # 检查当前图中的每条边是否在参考图中
+        for source, target, data in self.graph.edges(data=True):
+            relation = data.get('relation', '')
+            if self.reference_graph.has_edge(source, target) and self.reference_graph.edges[source, target].get('relation', '') == relation:
+                tp += 1
+            else:
+                fp += 1
+
+        # 检查参考图中的每条边是否在当前图中
+        for source, target, data in self.reference_graph.edges(data=True):
+            relation = data.get('relation', '')
+            if not self.graph.has_edge(source, target) or self.graph.edges[source, target].get('relation', '') != relation:
+                fn += 1
+
+        # 计算精确率(Precision)和召回率(Recall)
+        precision = tp / (tp + fp) if (tp + fp) > 0 else 0
+        recall = tp / (tp + fn) if (tp + fn) > 0 else 0
+
+        # 计算F1分数
+        f1 = 2 * precision * recall / (precision + recall) if (precision + recall) > 0 else 0
+
+        # 返回F1分数作为奖励
+        return 0.5 * f1  # 缩放因子0.5，使奖励在合理范围内
 
     def _causal_consistency_reward(self):
         """
@@ -462,6 +551,20 @@ class GraphEnvironment(gym.Env):
             return True
 
         return False
+
+    def _get_entity_type_distribution(self):
+        """
+        获取实体类型分布
+
+        返回:
+            type_distribution: 实体类型分布 (字典 {实体类型: 数量})
+        """
+        type_distribution = {}
+        for entity_type in self.entity_types.values():
+            if entity_type not in type_distribution:
+                type_distribution[entity_type] = 0
+            type_distribution[entity_type] += 1
+        return type_distribution
 
     def get_current_graph(self):
         """
